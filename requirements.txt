@@ -1,0 +1,1 @@
+# Intentionally minimal: attack simulation uses Python standard library only.

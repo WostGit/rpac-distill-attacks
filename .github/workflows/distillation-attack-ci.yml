@@ -1,0 +1,109 @@
+name: Distillation Attack CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  distillation-attack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONHASHSEED: "1234"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify checkout integrity and self-heal if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d .git ]] || [[ ! -f requirements.txt ]]; then
+            echo "Workspace appears corrupted or partially checked out; re-cloning..."
+            cd "$RUNNER_TEMP"
+            rm -rf repo-repair
+            git clone "https://github.com/${{ github.repository }}.git" repo-repair
+            cd repo-repair
+            git checkout "${{ github.sha }}"
+            rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.[!.]* "$GITHUB_WORKSPACE"/..?* || true
+            shopt -s dotglob
+            cp -a . "$GITHUB_WORKSPACE"/
+          fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build self-repairing venv and validate imports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          validate_imports() {
+            source .venv/bin/activate
+            python - <<'PY'
+import importlib
+mods = ["dataset", "teacher", "student", "attack", "pac_controller", "ci.run_ci_pipeline"]
+for m in mods:
+    importlib.import_module(m)
+print("Core module imports validated")
+PY
+          }
+
+          reinstall_once() {
+            rm -rf .venv
+            python -m venv .venv
+            source .venv/bin/activate
+            python -m pip install --upgrade pip wheel
+
+            backoff=2
+            attempt=1
+            while [[ $attempt -le 10 ]]; do
+              if pip install -r requirements.txt; then
+                return 0
+              fi
+              echo "Dependency install failed (attempt ${attempt}/10), retrying in ${backoff}s..."
+              sleep "$backoff"
+              backoff=$((backoff * 2))
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
+          cycle=1
+          while [[ $cycle -le 3 ]]; do
+            echo "Venv repair cycle: $cycle"
+            reinstall_once
+            if validate_imports; then
+              exit 0
+            fi
+            echo "Import validation failed, wiping venv and reinstalling..."
+            cycle=$((cycle + 1))
+          done
+
+          echo "Self-repairing environment setup failed" >&2
+          exit 10
+
+      - name: Run deterministic distillation attack simulations
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          mkdir -p artifacts
+          timeout 18m python ci/run_ci_pipeline.py --artifacts-dir artifacts --seed 1234
+
+      - name: Upload extraction metrics artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: distillation-attack-metrics
+          path: artifacts/*.json
+          if-no-files-found: error
