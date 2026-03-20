@@ -1,0 +1,113 @@
+name: Distillation Attack CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  extract-sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHON_VERSION: "3.10"
+      VENV_DIR: ".venv"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONHASHSEED: "0"
+      CI_SEED: "123"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Verify workspace and self-heal checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1 || ! git fsck --no-progress --strict >/dev/null 2>&1; then
+            echo "Workspace appears corrupted or partially checked out. Re-cloning..."
+            TMP_DIR="$(mktemp -d)"
+            git clone --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$TMP_DIR"
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            rsync -a --delete --exclude='.git' "$TMP_DIR/" ./
+            rm -rf "$TMP_DIR"
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+
+      - name: Create resilient virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          create_and_install() {
+            python -m venv "$VENV_DIR"
+            # shellcheck source=/dev/null
+            source "$VENV_DIR/bin/activate"
+            python -m pip install --upgrade pip wheel
+
+            local attempt=1
+            local max_attempts=10
+            local sleep_s=2
+            while [ "$attempt" -le "$max_attempts" ]; do
+              echo "Dependency install attempt ${attempt}/${max_attempts}"
+              if pip install -r requirements.txt; then
+                return 0
+              fi
+              if [ "$attempt" -eq "$max_attempts" ]; then
+                return 1
+              fi
+              sleep "$sleep_s"
+              sleep_s=$((sleep_s * 2))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          validate_imports() {
+            # shellcheck source=/dev/null
+            source "$VENV_DIR/bin/activate"
+            python - <<'PY'
+import importlib
+modules = ["data", "teacher", "student", "pac_controller", "attack", "run_attack_ci"]
+for m in modules:
+    importlib.import_module(m)
+print("Validated imports:", ", ".join(modules))
+PY
+          }
+
+          rm -rf "$VENV_DIR"
+          if ! create_and_install; then
+            echo "Failed to install dependencies after retries." >&2
+            exit 12
+          fi
+
+          if ! validate_imports; then
+            echo "Import validation failed. Rebuilding virtual environment..."
+            rm -rf "$VENV_DIR"
+            create_and_install
+            validate_imports
+          fi
+
+      - name: Run distillation attack pipeline (CPU only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$VENV_DIR/bin/activate"
+          export CUDA_VISIBLE_DEVICES=""
+          export OMP_NUM_THREADS="2"
+          export MKL_NUM_THREADS="2"
+          python run_attack_ci.py --artifacts-dir artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: extraction-metrics
+          path: |
+            artifacts/*.json
