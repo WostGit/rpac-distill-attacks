@@ -1,0 +1,206 @@
+name: Distillation Attack CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  distill-attack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PYTHON_VERSION: "3.10"
+      VENV_DIR: .venv
+      MAX_INSTALL_RETRIES: "10"
+      SEED: "42"
+      PYTHONHASHSEED: "42"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      CUBLAS_WORKSPACE_CONFIG: ":16:8"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Workspace integrity self-heal
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d .git ]] || [[ ! -f run_attack_pipeline.py ]]; then
+            echo "Workspace appears incomplete; repairing checkout"
+            tmp_dir="$(mktemp -d)"
+            git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "$tmp_dir/repo"
+            rsync -a --delete "$tmp_dir/repo/" "$GITHUB_WORKSPACE/"
+            rm -rf "$tmp_dir"
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build self-repairing venv and validate imports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          create_and_install() {
+            python -m venv "$VENV_DIR"
+            source "$VENV_DIR/bin/activate"
+            python -m pip install --upgrade pip setuptools wheel
+
+            local attempt=1
+            local max_attempts="${MAX_INSTALL_RETRIES}"
+            while (( attempt <= max_attempts )); do
+              if pip install -r requirements.txt; then
+                return 0
+              fi
+
+              sleep_sec=$(( 2 ** (attempt - 1) ))
+              if (( sleep_sec > 60 )); then
+                sleep_sec=60
+              fi
+              echo "Dependency install failed (attempt ${attempt}/${max_attempts}); retrying in ${sleep_sec}s"
+              sleep "$sleep_sec"
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
+          validate_imports() {
+            source "$VENV_DIR/bin/activate"
+            python - <<'PY'
+import importlib
+modules = ["teacher", "student", "pac_controller", "attack", "run_attack_pipeline"]
+for name in modules:
+    importlib.import_module(name)
+print("Core module imports validated")
+PY
+          }
+
+          if ! create_and_install; then
+            echo "Failed to install dependencies after retries" >&2
+            exit 10
+          fi
+
+          if ! validate_imports; then
+            echo "Import validation failed; rebuilding virtualenv"
+            rm -rf "$VENV_DIR"
+            if ! create_and_install; then
+              echo "Failed reinstall after venv reset" >&2
+              exit 11
+            fi
+            validate_imports
+          fi
+
+      - name: Run unprotected and protected extraction configs with self-healing retries
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$VENV_DIR/bin/activate"
+          mkdir -p results
+
+          run_mode() {
+            local mode="$1"
+            local out="results/${mode}.json"
+            local max_queries=400
+            local attempt=1
+            local max_attempts=4
+
+            while (( attempt <= max_attempts )); do
+              echo "Running mode=${mode} attempt=${attempt} max_queries=${max_queries}"
+              set +e
+              run_output="$(
+                python run_attack_pipeline.py \
+                --mode "$mode" \
+                --seed "$SEED" \
+                --max-queries "$max_queries" \
+                --out "$out"
+              )"
+              status=$?
+              set -e
+
+              if [[ $status -eq 0 ]]; then
+                python - <<PY
+import json, math
+from pathlib import Path
+p = Path("$out")
+obj = json.loads(p.read_text())
+required = ["student_accuracy", "agreement_rate", "queries_used", "pac_bound", "enforcement_triggered"]
+missing = [k for k in required if k not in obj]
+if missing:
+    raise SystemExit(f"Missing metrics in {p}: {missing}")
+if not math.isfinite(float(obj["pac_bound"])):
+    raise SystemExit("PAC bound is not finite")
+print("Validated metrics for", p)
+PY
+                return 0
+              fi
+
+              echo "$run_output"
+              if grep -Eqi "nan|inf|diverged" <<<"$run_output"; then
+                echo "Numerical instability detected; retrying with fewer queries"
+              elif grep -Eqi "memory|oom" <<<"$run_output"; then
+                echo "Memory issue detected; reducing queries"
+              else
+                echo "Run failed with status $status; reducing workload and retrying"
+              fi
+
+              max_queries=$(( max_queries / 2 ))
+              if (( max_queries < 50 )); then
+                echo "Cannot safely reduce workload further for ${mode}" >&2
+                return 12
+              fi
+              attempt=$((attempt + 1))
+            done
+
+            return 13
+          }
+
+          run_mode unprotected
+          run_mode protected
+
+      - name: Compare protected vs unprotected and enforce policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$VENV_DIR/bin/activate"
+          python - <<'PY'
+import json
+from pathlib import Path
+
+unprot = json.loads(Path("results/unprotected.json").read_text())
+prot = json.loads(Path("results/protected.json").read_text())
+
+if float(prot["pac_bound"]) <= 0:
+    raise SystemExit("PAC-style bound cannot be computed in protected run")
+
+if prot["student_accuracy"] >= unprot["student_accuracy"] and prot["agreement_rate"] >= unprot["agreement_rate"]:
+    raise SystemExit(
+        "Protected configuration did not reduce extraction success relative to unprotected baseline"
+    )
+
+summary = {
+    "unprotected": unprot,
+    "protected": prot,
+    "delta_student_accuracy": float(unprot["student_accuracy"]) - float(prot["student_accuracy"]),
+    "delta_agreement": float(unprot["agreement_rate"]) - float(prot["agreement_rate"]),
+}
+Path("results/summary.json").write_text(json.dumps(summary, indent=2))
+print(json.dumps(summary, indent=2))
+PY
+
+      - name: Upload attack metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: distillation-attack-metrics
+          path: |
+            results/unprotected.json
+            results/protected.json
+            results/summary.json
+          if-no-files-found: error
