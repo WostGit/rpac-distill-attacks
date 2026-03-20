@@ -1,0 +1,148 @@
+name: Distillation Attack CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  attack-sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [unprotected, protected]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure repository integrity (self-heal checkout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d .git ]] || [[ ! -f requirements.txt ]] || [[ ! -f scripts/run_attack_ci.py ]]; then
+            echo "Workspace appears incomplete/corrupt. Re-cloning."
+            REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+            TMP_DIR="$(mktemp -d)"
+            rm -rf ./* ./.??* || true
+            git clone --depth 1 "$REPO_URL" "$TMP_DIR"
+            shopt -s dotglob
+            mv "$TMP_DIR"/* .
+            rm -rf "$TMP_DIR"
+          fi
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build self-repairing virtualenv
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          install_with_retry() {
+            local tries=0
+            local max_tries=10
+            local sleep_s=2
+            until .venv/bin/pip install -r requirements.txt; do
+              tries=$((tries + 1))
+              if (( tries >= max_tries )); then
+                echo "Dependency install failed after ${max_tries} attempts" >&2
+                return 1
+              fi
+              echo "Install attempt ${tries} failed; retrying in ${sleep_s}s"
+              sleep "$sleep_s"
+              sleep_s=$((sleep_s * 2))
+            done
+          }
+
+          rebuild_venv() {
+            rm -rf .venv
+            python -m venv .venv
+            .venv/bin/python -m pip install --upgrade pip wheel setuptools
+            install_with_retry
+          }
+
+          validate_imports() {
+            .venv/bin/python -c "import importlib; mods=['teacher','student','attack','pac_controller','scripts.run_attack_ci']; [importlib.import_module(m) for m in mods]; print('Import validation succeeded')"
+          }
+
+          rebuild_venv
+          if ! validate_imports; then
+            echo "Import validation failed after first install; rebuilding venv"
+            rebuild_venv
+            validate_imports
+          fi
+
+      - name: Run distillation attack simulation (${{ matrix.config }})
+        shell: bash
+        env:
+          PYTHONHASHSEED: "0"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p outputs/${{ matrix.config }}
+          .venv/bin/python scripts/run_attack_ci.py \
+            --config "${{ matrix.config }}" \
+            --timeout-s 900 \
+            --out "outputs/${{ matrix.config }}/metrics.json"
+
+      - name: Upload metrics artifact (${{ matrix.config }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ matrix.config }}
+          path: outputs/${{ matrix.config }}/metrics.json
+
+  compare-results:
+    runs-on: ubuntu-latest
+    needs: attack-sim
+    steps:
+      - name: Download unprotected metrics
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics-unprotected
+          path: outputs/unprotected
+
+      - name: Download protected metrics
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics-protected
+          path: outputs/protected
+
+      - name: Validate privacy protection effectiveness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+import json
+import sys
+from pathlib import Path
+
+unp = json.loads(Path("outputs/unprotected/metrics.json").read_text())
+pro = json.loads(Path("outputs/protected/metrics.json").read_text())
+
+issues = []
+if "pac_bound" not in unp or "pac_bound" not in pro:
+    issues.append("PAC-style bound missing")
+if not isinstance(pro.get("enforcement_triggered"), bool):
+    issues.append("Protected run missing enforcement status")
+if pro["teacher_student_agreement"] >= unp["teacher_student_agreement"]:
+    issues.append("Protected run did not reduce extraction success (agreement)")
+if pro["teacher_student_kl"] <= unp["teacher_student_kl"]:
+    issues.append("Protected run did not increase divergence vs baseline")
+
+if issues:
+    for issue in issues:
+        print(f"ERROR: {issue}", file=sys.stderr)
+    sys.exit(55)
+
+print("Protection validation passed")
+print("unprotected:", unp)
+print("protected:", pro)
+PY
